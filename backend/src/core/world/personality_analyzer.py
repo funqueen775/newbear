@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -428,6 +429,7 @@ def get_profile_response(user_id: str, profile: dict[str, Any] | None) -> dict[s
     if session_count <= 0 and not has_profile_scores:
         return _empty_profile_response(user_id)
 
+    generated_at = _utc_now_iso()
     big_five = _normalize_score_mapping(profile.get("big_five"), BIG_FIVE_TRAITS, default=50)
     decision_style = _normalize_score_mapping(
         profile.get("decision_style"),
@@ -435,6 +437,12 @@ def get_profile_response(user_id: str, profile: dict[str, Any] | None) -> dict[s
         default=0,
     )
     latest_session = history[-1] if history else {}
+    latest_scores = _latest_big_five_scores(latest_session, big_five)
+    latest_decision_style = _latest_decision_style_scores(latest_session, decision_style)
+    public_history = [
+        _public_session(session, index)
+        for index, session in enumerate(history, start=1)
+    ]
 
     return {
         "user_id": str(user_id),
@@ -442,31 +450,39 @@ def get_profile_response(user_id: str, profile: dict[str, Any] | None) -> dict[s
         "session_count": session_count,
         "big_five": big_five,
         "decision_style": decision_style,
+        "latest_scores": latest_scores,
+        "latest_decision_style": latest_decision_style,
         "summary": str(profile.get("summary") or ""),
         "latest_session_id": profile.get("latest_session_id") or latest_session.get("session_id"),
         "behavior_evidence": _safe_list(
             latest_session.get("behavior_evidence") or profile.get("behavior_evidence")
         ),
-        "sessions": [_public_session(session, index) for index, session in enumerate(history, start=1)],
+        "session_history": public_history,
+        "sessions": public_history,
+        "evidence_summary": _build_evidence_summary(profile, history),
         "trend": get_trend(profile),
+        "updated_at": str(profile.get("updated_at") or generated_at),
+        "generated_at": generated_at,
     }
 
 
 def get_trend_response(user_id: str, trend: dict[str, Any] | None) -> dict[str, Any]:
     """Shape trend data for a future trend API response."""
     trend_data = trend if _looks_like_trend(trend) else get_trend(trend)
+    normalized = _normalize_trend_data(trend_data)
 
     return {
         "user_id": str(user_id),
-        "has_data": bool(trend_data["session_count"]),
-        "session_count": trend_data["session_count"],
-        "big_five_trend": trend_data["big_five_trend"],
-        "latest_scores": trend_data["latest_scores"],
-        "delta": trend_data["delta"],
-        "direction": trend_data["direction"],
-        "decision_style_trend": trend_data["decision_style_trend"],
-        "latest_decision_style": trend_data["latest_decision_style"],
-        "decision_delta": trend_data["decision_delta"],
+        "has_data": bool(normalized["session_count"]),
+        "session_count": normalized["session_count"],
+        "big_five_trend": normalized["big_five_trend"],
+        "latest_scores": normalized["latest_scores"],
+        "delta": normalized["delta"],
+        "direction": normalized["direction"],
+        "decision_style_trend": normalized["decision_style_trend"],
+        "latest_decision_style": normalized["latest_decision_style"],
+        "decision_delta": normalized["decision_delta"],
+        "generated_at": _utc_now_iso(),
     }
 
 
@@ -730,9 +746,11 @@ def _extract_sessions(profile_or_sessions: Any) -> list[dict[str, Any]]:
 
 
 def _public_session(session: dict[str, Any], index: int) -> dict[str, Any]:
+    evidence = _safe_list(session.get("behavior_evidence"))
     return {
         "session_id": str(session.get("session_id") or f"session-{index}"),
         "index": int(session.get("index") or index),
+        "weight": _positive_float(session.get("weight"), default=1.0),
         "big_five": _normalize_score_mapping(
             _read_mapping(session, "big_five", "scores"),
             BIG_FIVE_TRAITS,
@@ -743,22 +761,129 @@ def _public_session(session: dict[str, Any], index: int) -> dict[str, Any]:
             DECISION_STYLES,
             default=0,
         ),
+        "behavior_evidence": evidence[:12],
+        "evidence_count": len(evidence),
         "summary": str(session.get("summary") or ""),
     }
 
 
+def _latest_big_five_scores(
+    latest_session: dict[str, Any],
+    fallback: dict[str, int],
+) -> dict[str, int]:
+    source = _read_mapping(latest_session, "big_five", "scores")
+    if isinstance(source, dict):
+        return _normalize_score_mapping(source, BIG_FIVE_TRAITS, default=50)
+    return {trait: _clamp_score(fallback.get(trait, 50)) for trait in BIG_FIVE_TRAITS}
+
+
+def _latest_decision_style_scores(
+    latest_session: dict[str, Any],
+    fallback: dict[str, int],
+) -> dict[str, int]:
+    source = _read_mapping(latest_session, "decision_style")
+    if isinstance(source, dict):
+        return _normalize_score_mapping(source, DECISION_STYLES, default=0)
+    return {style: _clamp_score(fallback.get(style, 0), default=0) for style in DECISION_STYLES}
+
+
+def _build_evidence_summary(
+    profile: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+
+    for evidence in _safe_list(profile.get("behavior_evidence")):
+        item = _public_evidence_item(evidence)
+        if item is not None:
+            items.append(item)
+
+    for session in history:
+        session_id = str(session.get("session_id") or "")
+        for evidence in _safe_list(session.get("behavior_evidence")):
+            item = _public_evidence_item(evidence, session_id=session_id)
+            if item is not None:
+                items.append(item)
+
+    if not items:
+        return _empty_evidence_summary()
+
+    by_dimension = _empty_dimension_counts()
+    for item in items:
+        dimension = str(item.get("dimension") or "")
+        if not dimension:
+            continue
+        by_dimension[dimension] = by_dimension.get(dimension, 0) + 1
+
+    return {
+        "count": len(items),
+        "by_dimension": by_dimension,
+        "latest": items[-5:],
+        "items": items[:20],
+    }
+
+
+def _public_evidence_item(evidence: Any, *, session_id: str = "") -> dict[str, Any] | None:
+    if isinstance(evidence, dict):
+        text = _clean_text(evidence.get("text") or evidence.get("summary") or evidence.get("content"))
+        if not text:
+            return None
+
+        return {
+            "session_id": str(evidence.get("session_id") or session_id),
+            "source": str(evidence.get("source") or ""),
+            "dimension": str(evidence.get("dimension") or ""),
+            "label": str(evidence.get("label") or ""),
+            "text": _clip_text(text),
+            "signals": [str(item) for item in _safe_list(evidence.get("signals"))][:4],
+        }
+
+    text = _clean_text(evidence)
+    if not text:
+        return None
+
+    return {
+        "session_id": session_id,
+        "source": "",
+        "dimension": "",
+        "label": "",
+        "text": _clip_text(text),
+        "signals": [],
+    }
+
+
+def _empty_evidence_summary() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "by_dimension": _empty_dimension_counts(),
+        "latest": [],
+        "items": [],
+    }
+
+
+def _empty_dimension_counts() -> dict[str, int]:
+    return {dimension: 0 for dimension in BIG_FIVE_TRAITS + DECISION_STYLES}
+
+
 def _empty_profile_response(user_id: str) -> dict[str, Any]:
+    generated_at = _utc_now_iso()
     return {
         "user_id": str(user_id),
         "has_data": False,
         "session_count": 0,
         "big_five": {},
         "decision_style": {},
+        "latest_scores": {},
+        "latest_decision_style": {},
         "summary": "",
         "latest_session_id": None,
         "behavior_evidence": [],
+        "session_history": [],
         "sessions": [],
+        "evidence_summary": _empty_evidence_summary(),
         "trend": _empty_trend(),
+        "updated_at": generated_at,
+        "generated_at": generated_at,
     }
 
 
@@ -773,6 +898,147 @@ def _empty_trend() -> dict[str, Any]:
         "latest_decision_style": {},
         "decision_delta": {},
     }
+
+
+def _normalize_trend_data(trend_data: Any) -> dict[str, Any]:
+    if not isinstance(trend_data, dict):
+        return _empty_trend()
+
+    big_five_trend = _normalize_trend_series_map(
+        trend_data.get("big_five_trend"),
+        BIG_FIVE_TRAITS,
+    )
+    decision_style_trend = _normalize_trend_series_map(
+        trend_data.get("decision_style_trend"),
+        DECISION_STYLES,
+    )
+    session_count = _trend_session_count(trend_data, big_five_trend)
+
+    if session_count <= 0:
+        return _empty_trend()
+
+    latest_scores = _normalize_latest_scores(
+        trend_data.get("latest_scores"),
+        big_five_trend,
+        BIG_FIVE_TRAITS,
+        default=50,
+    )
+    latest_decision_style = _normalize_latest_scores(
+        trend_data.get("latest_decision_style"),
+        decision_style_trend,
+        DECISION_STYLES,
+        default=0,
+    )
+    delta = _normalize_delta_mapping(
+        trend_data.get("delta"),
+        big_five_trend,
+        BIG_FIVE_TRAITS,
+    )
+    decision_delta = _normalize_delta_mapping(
+        trend_data.get("decision_delta"),
+        decision_style_trend,
+        DECISION_STYLES,
+    )
+    direction_source = trend_data.get("direction") if isinstance(trend_data.get("direction"), dict) else {}
+
+    return {
+        "session_count": session_count,
+        "big_five_trend": big_five_trend,
+        "latest_scores": latest_scores,
+        "delta": delta,
+        "direction": {
+            trait: str(direction_source.get(trait) or _direction(delta[trait]))
+            for trait in BIG_FIVE_TRAITS
+        },
+        "decision_style_trend": decision_style_trend,
+        "latest_decision_style": latest_decision_style,
+        "decision_delta": decision_delta,
+    }
+
+
+def _normalize_trend_series_map(
+    source: Any,
+    dimensions: tuple[str, ...],
+) -> dict[str, list[dict[str, Any]]]:
+    source_map = source if isinstance(source, dict) else {}
+    return {
+        dimension: _normalize_trend_series(source_map.get(dimension), dimension)
+        for dimension in dimensions
+    }
+
+
+def _normalize_trend_series(source: Any, dimension: str) -> list[dict[str, Any]]:
+    series: list[dict[str, Any]] = []
+    for index, point in enumerate(_safe_list(source), start=1):
+        if isinstance(point, dict):
+            point_index = _safe_int(point.get("index"), default=index)
+            session_id = str(point.get("session_id") or f"session-{point_index}")
+            score = _clamp_score(point.get("score"))
+        else:
+            point_index = index
+            session_id = f"session-{index}"
+            score = _clamp_score(point)
+
+        series.append(
+            {
+                "session_id": session_id,
+                "index": point_index,
+                "score": score,
+            }
+        )
+
+    return series
+
+
+def _trend_session_count(
+    trend_data: dict[str, Any],
+    big_five_trend: dict[str, list[dict[str, Any]]],
+) -> int:
+    explicit_count = _safe_int(trend_data.get("session_count"), default=0)
+    series_count = max((len(series) for series in big_five_trend.values()), default=0)
+    return max(explicit_count, series_count)
+
+
+def _normalize_latest_scores(
+    source: Any,
+    trend_map: dict[str, list[dict[str, Any]]],
+    dimensions: tuple[str, ...],
+    *,
+    default: int,
+) -> dict[str, int]:
+    if isinstance(source, dict):
+        return _normalize_score_mapping(source, dimensions, default=default)
+
+    latest: dict[str, int] = {}
+    for dimension in dimensions:
+        series = trend_map.get(dimension) or []
+        latest[dimension] = _clamp_score(series[-1]["score"], default=default) if series else default
+    return latest
+
+
+def _normalize_delta_mapping(
+    source: Any,
+    trend_map: dict[str, list[dict[str, Any]]],
+    dimensions: tuple[str, ...],
+) -> dict[str, int]:
+    source_map = source if isinstance(source, dict) else {}
+    delta: dict[str, int] = {}
+
+    for dimension in dimensions:
+        if dimension in source_map:
+            delta[dimension] = _safe_int(source_map.get(dimension), default=0)
+            continue
+
+        series = trend_map.get(dimension) or []
+        if len(series) >= 2:
+            delta[dimension] = _safe_int(series[-1]["score"], default=0) - _safe_int(
+                series[0]["score"],
+                default=0,
+            )
+        else:
+            delta[dimension] = 0
+
+    return delta
 
 
 def _looks_like_trend(value: Any) -> bool:
@@ -958,6 +1224,21 @@ def _positive_float(value: Any, *, default: float) -> float:
     if not math.isfinite(number) or number <= 0:
         return default
     return number
+
+
+def _safe_int(value: Any, *, default: int) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    if not math.isfinite(number):
+        return default
+    return int(round(number))
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _direction(delta: int) -> str:

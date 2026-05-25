@@ -118,9 +118,15 @@ def test_empty_data_fallbacks() -> None:
     assert trend["latest_scores"] == {}
     assert profile_response["has_data"] is False
     assert profile_response["big_five"] == {}
+    assert profile_response["latest_scores"] == {}
+    assert profile_response["session_history"] == []
+    assert profile_response["evidence_summary"]["count"] == 0
+    assert profile_response["updated_at"].endswith("Z")
+    assert profile_response["generated_at"].endswith("Z")
     assert profile_response["trend"]["session_count"] == 0
     assert trend_response["has_data"] is False
     assert trend_response["delta"] == {}
+    assert trend_response["generated_at"].endswith("Z")
 
 
 def test_analyze_session_extracts_report_and_user_input_signals() -> None:
@@ -162,3 +168,58 @@ def test_analyze_session_extracts_report_and_user_input_signals() -> None:
     assert result["source_counts"]["user_inputs"] == 2
     assert any("数据和成本风险" in item["text"] for item in result["behavior_evidence"])
     assert "行为证据" in result["summary"]
+
+
+def test_profile_response_contains_api_ready_schema_for_single_session() -> None:
+    session_result = _session("s1", openness=76, conscientiousness=82)
+    session_result["behavior_evidence"] = [
+        {
+            "source": "user_input",
+            "dimension": "openness",
+            "label": "开放性",
+            "text": "提出新方案并主动验证。",
+            "signals": ["新方案", "验证"],
+        }
+    ]
+    profile = update_user_profile("user-1", None, session_result)
+
+    response = get_profile_response("user-1", profile)
+
+    assert response["user_id"] == "user-1"
+    assert response["session_count"] == 1
+    assert response["big_five"]["openness"] == 76
+    assert response["decision_style"]["rational"] == 76
+    assert response["latest_scores"]["openness"] == 76
+    assert len(response["session_history"]) == 1
+    assert response["session_history"][0]["evidence_count"] == 1
+    assert response["evidence_summary"]["count"] == 1
+    assert response["evidence_summary"]["by_dimension"]["openness"] == 1
+    assert response["updated_at"].endswith("Z")
+    assert response["generated_at"].endswith("Z")
+
+
+def test_trend_response_contains_full_big_five_series_for_multiple_sessions() -> None:
+    profile = update_user_profile("user-1", None, _session("s1", openness=40, conscientiousness=70))
+    profile = update_user_profile("user-1", profile, _session("s2", openness=55, conscientiousness=60))
+    profile = update_user_profile("user-1", profile, _session("s3", openness=70, conscientiousness=50))
+
+    profile_response = get_profile_response("user-1", profile)
+    trend_response = get_trend_response("user-1", profile["trend"])
+
+    assert profile_response["session_count"] == 3
+    assert profile_response["latest_scores"]["openness"] == 70
+    assert len(profile_response["session_history"]) == 3
+    assert trend_response["session_count"] == 3
+    assert trend_response["latest_scores"]["openness"] == 70
+    assert trend_response["delta"]["openness"] == 30
+    assert trend_response["direction"]["openness"] == "up"
+    assert trend_response["generated_at"].endswith("Z")
+    for trait in (
+        "openness",
+        "conscientiousness",
+        "extraversion",
+        "agreeableness",
+        "neuroticism",
+    ):
+        assert trait in trend_response["big_five_trend"]
+        assert len(trend_response["big_five_trend"][trait]) == 3
