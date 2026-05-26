@@ -26,7 +26,7 @@ def init_db() -> None:
                 password_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            """
+            """ 
         )
 
         connection.execute(
