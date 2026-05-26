@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+try:
+    from src.core.db import user_profile as _profile_store
+except Exception:  # pragma: no cover - exercised through fallback behavior.
+    _profile_store = None
 
 
 BIG_FIVE_TRAITS = (
@@ -248,7 +253,21 @@ STYLE_KEYWORDS = {
 }
 
 
-def analyze_session(session_id: str, report: Any, user_inputs: Any) -> dict[str, Any]:
+@dataclass
+class SessionBehaviorData:
+    session_id: str
+    big_five: dict[str, int]
+    decision_style: dict[str, int]
+    behavior_evidence: list[dict[str, Any]]
+    summary: str
+    source_counts: dict[str, int]
+    session_weight: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def analyze_session(session_id: str, report: dict, user_inputs: list[dict]) -> SessionBehaviorData:
     """Extract one-session personality signals from report and player behavior."""
     report_scores = _extract_report_scores(report)
     text_records = _collect_text_records(report, user_inputs)
@@ -274,20 +293,49 @@ def analyze_session(session_id: str, report: Any, user_inputs: Any) -> dict[str,
 
     behavior_evidence = _build_behavior_evidence(text_records)
 
-    return {
-        "session_id": str(session_id),
-        "big_five": big_five,
-        "decision_style": decision_style,
-        "behavior_evidence": behavior_evidence,
-        "summary": _build_session_summary(big_five, decision_style, behavior_evidence),
-        "source_counts": {
+    return SessionBehaviorData(
+        session_id=str(session_id),
+        big_five=big_five,
+        decision_style=decision_style,
+        behavior_evidence=behavior_evidence,
+        summary=_build_session_summary(big_five, decision_style, behavior_evidence),
+        source_counts={
             "report_evidence": _count_report_evidence(report),
             "user_inputs": _count_user_inputs(user_inputs),
         },
-    }
+    )
 
 
 def update_user_profile(
+    user_id: str,
+    behavior: SessionBehaviorData,
+) -> dict[str, Any]:
+    """Create or update the persisted personality profile for a user."""
+    session_result = _behavior_to_dict(behavior)
+    existing_profile = _load_personality_profile_for_update(user_id)
+    updated_profile = _merge_user_profile(user_id, existing_profile, session_result)
+    return _save_personality_profile(user_id, updated_profile)
+
+
+def get_trend(user_id: str) -> dict[str, Any]:
+    """Return cross-session score movement for a user."""
+    profile = _load_personality_profile(user_id)
+    if profile is None:
+        return _empty_trend()
+    return _calculate_trend(profile)
+
+
+def get_profile_response(user_id: str) -> dict[str, Any]:
+    """Shape the persisted profile object for the profile API response."""
+    return _build_profile_response(user_id, _load_personality_profile(user_id))
+
+
+def get_trend_response(user_id: str) -> dict[str, Any]:
+    """Shape persisted trend data for the trend API response."""
+    return _build_trend_response(user_id, get_trend(user_id))
+
+
+def _merge_user_profile(
     user_id: str,
     existing_profile: dict[str, Any] | None,
     session_result: dict[str, Any],
@@ -344,7 +392,7 @@ def update_user_profile(
         decision_style=session_decision_style,
     )
     session_history = history + [session_entry]
-    trend = get_trend(session_history)
+    trend = _calculate_trend(session_history)
 
     return {
         "user_id": str(user_id),
@@ -359,7 +407,7 @@ def update_user_profile(
     }
 
 
-def get_trend(profile_or_sessions: Any) -> dict[str, Any]:
+def _calculate_trend(profile_or_sessions: Any) -> dict[str, Any]:
     """Return cross-session score movement for profile history or session lists."""
     sessions = _extract_sessions(profile_or_sessions)
     if not sessions and isinstance(profile_or_sessions, dict) and isinstance(
@@ -418,7 +466,7 @@ def get_trend(profile_or_sessions: Any) -> dict[str, Any]:
     }
 
 
-def get_profile_response(user_id: str, profile: dict[str, Any] | None) -> dict[str, Any]:
+def _build_profile_response(user_id: str, profile: dict[str, Any] | None) -> dict[str, Any]:
     """Shape a profile object for a future profile API response."""
     if not isinstance(profile, dict) or not profile:
         return _empty_profile_response(user_id)
@@ -460,15 +508,15 @@ def get_profile_response(user_id: str, profile: dict[str, Any] | None) -> dict[s
         "session_history": public_history,
         "sessions": public_history,
         "evidence_summary": _build_evidence_summary(profile, history),
-        "trend": get_trend(profile),
+        "trend": _calculate_trend(profile),
         "updated_at": str(profile.get("updated_at") or generated_at),
         "generated_at": generated_at,
     }
 
 
-def get_trend_response(user_id: str, trend: dict[str, Any] | None) -> dict[str, Any]:
+def _build_trend_response(user_id: str, trend: dict[str, Any] | None) -> dict[str, Any]:
     """Shape trend data for a future trend API response."""
-    trend_data = trend if _looks_like_trend(trend) else get_trend(trend)
+    trend_data = trend if _looks_like_trend(trend) else _calculate_trend(trend)
     normalized = _normalize_trend_data(trend_data)
 
     return {
@@ -484,6 +532,117 @@ def get_trend_response(user_id: str, trend: dict[str, Any] | None) -> dict[str, 
         "decision_delta": normalized["decision_delta"],
         "generated_at": _utc_now_iso(),
     }
+
+
+def _behavior_to_dict(behavior: Any) -> dict[str, Any]:
+    if isinstance(behavior, SessionBehaviorData):
+        return behavior.to_dict()
+    if is_dataclass(behavior):
+        return asdict(behavior)
+    if isinstance(behavior, dict):
+        return deepcopy(behavior)
+    return _as_mapping(behavior)
+
+
+def _load_personality_profile(user_id: str) -> dict[str, Any] | None:
+    if _profile_store is None:
+        return None
+
+    store_user_id = _store_user_id(user_id)
+    if store_user_id is None:
+        return None
+
+    try:
+        row = _profile_store.get_user_profile(store_user_id)
+    except Exception:
+        return None
+
+    return _extract_profile_from_store_row(row)
+
+
+def _load_personality_profile_for_update(user_id: str) -> dict[str, Any] | None:
+    if _profile_store is None:
+        return None
+
+    store_user_id = _store_user_id(user_id)
+    if store_user_id is None:
+        return None
+
+    try:
+        row = _profile_store.init_user_profile(store_user_id)
+    except Exception:
+        row = None
+
+    profile = _extract_profile_from_store_row(row)
+    if profile is not None:
+        return profile
+
+    return _load_personality_profile(user_id)
+
+
+def _save_personality_profile(user_id: str, profile: dict[str, Any]) -> dict[str, Any]:
+    if _profile_store is None:
+        return profile
+
+    store_user_id = _store_user_id(user_id)
+    if store_user_id is None:
+        return profile
+
+    try:
+        row = _profile_store.update_user_profile(store_user_id, profile)
+    except Exception:
+        return profile
+
+    saved_profile = _extract_profile_from_store_row(row)
+    if saved_profile is None:
+        return profile
+
+    return saved_profile
+
+
+def _store_user_id(user_id: str) -> int | None:
+    try:
+        text = str(user_id).strip()
+        if not text:
+            return None
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_profile_from_store_row(row: Any) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+
+    profile: dict[str, Any] | None = None
+    personality_data = row.get("personality_data")
+    if _looks_like_profile(personality_data):
+        profile = deepcopy(personality_data)
+    elif _looks_like_profile(row):
+        profile = deepcopy(row)
+
+    if profile is None:
+        return None
+
+    updated_at = row.get("updated_at")
+    if updated_at and not profile.get("updated_at"):
+        profile["updated_at"] = str(updated_at)
+
+    return profile
+
+
+def _looks_like_profile(value: Any) -> bool:
+    return isinstance(value, dict) and any(
+        key in value
+        for key in (
+            "big_five",
+            "decision_style",
+            "session_history",
+            "sessions",
+            "trend",
+            "session_count",
+        )
+    )
 
 
 def _extract_report_scores(report: Any) -> dict[str, int]:
