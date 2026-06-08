@@ -155,7 +155,15 @@ LLM_TIMEOUT_SECONDS=30
 | `/api/meeting/say` | `response_meta.user_free_text_input = message`，`scene_name = meeting` |
 | `/api/pantry/say` | `response_meta.user_free_text_input = message`，`scene_name = pantry` |
 
-推荐下一步新增一个 adapter，而不是让前端直接调用评分模块：
+已新增 adapter：
+
+```text
+backend/src/core/world/personality_model/adapter.py
+```
+
+adapter 负责把主项目里的 `user + world + scene + 玩家输入` 转换成 personality-model 需要的 `ScoreInput`。当前还没有改 `server.py`，不会影响现有接口运行；下一步是在后端输入入口接入调用。
+
+推荐后端内部调用 adapter，而不是让前端直接调用评分模块：
 
 ```text
 server.py / world flow
@@ -163,6 +171,31 @@ server.py / world flow
   -> personality_model.score(...)
   -> persist final_result.feedback / evidence
 ```
+
+调用示例：
+
+```python
+from src.core.world.personality_model.adapter import build_score_input_from_world
+from src.core.world.personality_model.hybrid_scorer import score
+
+score_input = build_score_input_from_world(
+    user=user,
+    world=world,
+    scene="world",  # 或 "meeting" / "pantry"
+    user_text=affair,  # meeting / pantry 场景传 message
+)
+
+result = score(score_input, method="hybrid", use_llm=False)
+final_result = result.final_result
+```
+
+接入注意事项：
+
+- `/api/step` 建议在 `run_one_step(world, affair=affair)` 之前生成 `score_input`，这样 adapter 能拿到当前 `pending_incident`。
+- `/api/meeting/say` 和 `/api/pantry/say` 可以在 `add_user_meeting_message` / `add_user_pantry_message` 附近接。
+- 第一版建议 `use_llm=False`，只跑规则 fallback。
+- 评分失败时建议只记录日志，不要阻断主流程。
+- 后端还需要决定 `final_result.feedback` 写回哪里，以及 `final_result.evidence` / `decision_style` 是否存给报告页。
 
 ## 假设
 

@@ -14,6 +14,7 @@
 | 2026-06-08 | Phase 3 | 新增 `backend/src/core/world/personality_model/` | 将独立评分模块纳入 newbear 后端世界模块目录 |
 | 2026-06-08 | Phase 3 | 引入 `schemas.py`、`rule_scorer.py`、`llm_scorer.py`、`hybrid_scorer.py` 等核心文件 | 支持 rule baseline、LLM zero-shot、hybrid 和 `final_result` 输出 |
 | 2026-06-08 | Phase 3 | 暂不修改 `server.py`、前端组件和现有 report 流程 | 降低对已打通前后端主线的影响 |
+| 2026-06-08 | Phase 3 | 新增 `backend/src/core/world/personality_model/adapter.py` | 先放入主项目字段转换层，将 `user + world + scene + 玩家输入` 映射为 `ScoreInput`，暂不接 `server.py` |
 
 ## 决策记录
 
@@ -29,11 +30,52 @@
 
 | 优先级 | 任务 | 说明 |
 |------|------|------|
-| P0 | 新增 newbear adapter | 把 `/api/step`、`/api/meeting/say`、`/api/pantry/say` 的输入映射为 `ScoreInput` |
+| P0 | 接入 newbear adapter | adapter 文件已新增；下一步在 `/api/step`、`/api/meeting/say`、`/api/pantry/say` 调用并处理 `final_result` |
 | P0 | 增加 BE-007 测试 | 验证 rule fallback、event_id 校验、`final_result.feedback` 输出 |
 | P1 | 设计持久化位置 | 明确 `final_result` 存到 `reports`、`user_profiles` 还是新增表 |
 | P1 | 与报告页对齐展示字段 | 报告页优先使用 `final_result.evidence`、`decision_style`，不展示调试字段 |
 | P2 | 封装 `/score/event` 和 `/score/session` | 如后端需要独立调试接口，再加 HTTP 路由 |
+
+## 后端接入说明
+
+adapter 已在当前分支新增：
+
+```text
+backend/src/core/world/personality_model/adapter.py
+```
+
+后续在 `server.py` 三个玩家输入入口接入：
+
+| 路由 | adapter 参数 |
+|------|------|
+| `/api/step` | `scene="world"`，`user_text=affair` |
+| `/api/meeting/say` | `scene="meeting"`，`user_text=message` |
+| `/api/pantry/say` | `scene="pantry"`，`user_text=message` |
+
+推荐调用方式：
+
+```python
+from src.core.world.personality_model.adapter import build_score_input_from_world
+from src.core.world.personality_model.hybrid_scorer import score
+
+score_input = build_score_input_from_world(
+    user=user,
+    world=world,
+    scene="world",  # 或 "meeting" / "pantry"
+    user_text=affair,  # meeting / pantry 场景传 message
+)
+
+result = score(score_input, method="hybrid", use_llm=False)
+final_result = result.final_result
+```
+
+接入建议：
+
+- `/api/step` 建议在 `run_one_step(world, affair=affair)` 之前生成 `score_input`，以保留当前 `pending_incident` 上下文。
+- `/api/meeting/say` 和 `/api/pantry/say` 可以在 `add_user_meeting_message` / `add_user_pantry_message` 附近接。
+- 第一版建议 `use_llm=False`，只跑规则 fallback。
+- 评分失败时只记录日志，不阻断主流程。
+- 后端还需要决定 `final_result.feedback` 写回位置，以及 `evidence` / `decision_style` 是否进入报告页数据。
 
 ## 验收标准
 
