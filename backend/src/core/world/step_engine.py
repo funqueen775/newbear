@@ -164,7 +164,7 @@ def run_settle_phase(world: WorldRuntimeState, affair: str = "") -> WorldRuntime
             "intent": actor.intent,
             "task": actor.current_task,
             "speech": actor.last_speech,
-            "memory": actor.memory[-5:],
+            "memory": actor.memory_texts[-5:],
         }
         for actor in world.actors.values()
     ]

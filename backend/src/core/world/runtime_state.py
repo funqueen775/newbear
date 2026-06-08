@@ -16,11 +16,15 @@ class ActorRuntimeState:
     intent: str = ""
     move_to: str = ""
     last_speech: str = ""
-    memory: list[str] = field(default_factory=list)
     pending_action: dict[str, Any] = field(default_factory=dict)
     memory_stream: list[MemoryRecord] = field(default_factory=list)
+
+    @property
+    def memory_texts(self) -> list[str]:
+        return [m.text for m in self.memory_stream]
     memory_next_id: int = 1
     reflection_importance_buffer: int = 0
+    relationships: dict[str, RelationshipRecord] = field(default_factory=dict)
 
 
 
@@ -138,18 +142,23 @@ class MemoryRecord:
     importance: int = 1
     tags: list[str] = field(default_factory=list)
     related_actor_ids: list[str] = field(default_factory=list)
+    archived: bool = False
+    caused_by_id: int | None = None
+
+
+@dataclass
+class RelationshipRecord:
+    target_actor_id: str
+    trust: int = 50
+    impression: str = ""
+    interaction_count: int = 0
+    last_interaction_step: int = 0
+    last_interaction_clock: str = ""
 
 @dataclass
 class WorldRuntimeState:
     company: CompanyRuntimeState
     actors: dict[str, ActorRuntimeState]
-    seed_id: str = ""
-    seed_summary: dict[str, Any] = field(default_factory=dict)
-    incident_pool_ids: list[str] = field(default_factory=list)
-    meeting_topic_ids: list[str] = field(default_factory=list)
-    pantry_topic_ids: list[str] = field(default_factory=list)
-    report_template_ids: list[str] = field(default_factory=list)
-    session_record_id: str = ""
     user_inputs: list[UserInputRecord] = field(default_factory=list)
     encounters: list[EncounterRecord] = field(default_factory=list)
     map_data: dict[str, Any] = field(default_factory=dict)
@@ -163,5 +172,6 @@ class WorldRuntimeState:
     triggered_pantry_ids: set[str] = field(default_factory=set)
     active_report: ActiveReportState | None = None
     report_generated: bool = False
-    report_saved: bool = False
+
+
 

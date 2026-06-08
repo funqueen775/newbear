@@ -24,6 +24,11 @@ def schedule_memory_reflections(
     *,
     world_lock: threading.Lock,
 ) -> None:
+    from src.core.world.seed_loader import load_world_seed
+
+    seed = load_world_seed()
+    character_by_id = {item["actor_id"]: item for item in seed["characters"]}
+
     for actor in world.actors.values():
         if actor.reflection_importance_buffer < REFLECTION_THRESHOLD:
             continue
@@ -37,6 +42,7 @@ def schedule_memory_reflections(
 
         memory_snapshot = list(actor.memory_stream[-REFLECTION_MEMORY_LIMIT:])
         display_name = actor.display_name
+        character = character_by_id.get(actor_id)
 
         _REFLECTION_EXECUTOR.submit(
             _run_actor_reflection_task,
@@ -45,6 +51,7 @@ def schedule_memory_reflections(
             actor_id,
             display_name,
             memory_snapshot,
+            character,
         )
 
 
@@ -54,11 +61,13 @@ def _run_actor_reflection_task(
     actor_id: str,
     display_name: str,
     memory_snapshot: list[MemoryRecord],
+    character: dict[str, Any] | None,
 ) -> None:
     try:
         reflections = _build_reflections(
             display_name=display_name,
             memories=memory_snapshot,
+            character=character,
         )
 
         if not reflections:
@@ -69,15 +78,18 @@ def _run_actor_reflection_task(
             if actor is None:
                 return
 
-            for reflection in reflections:
+            for reflection_text in reflections:
                 append_actor_memory(
                     world,
                     actor_id=actor_id,
                     kind="reflection",
-                    text=reflection,
+                    text=reflection_text,
                     clock=world.company.clock,
                     tags=["reflection"],
                 )
+
+            for memory in memory_snapshot:
+                memory.archived = True
 
             actor.reflection_importance_buffer = 0
 
@@ -90,9 +102,22 @@ def _build_reflections(
     *,
     display_name: str,
     memories: list[MemoryRecord],
+    character: dict[str, Any] | None = None,
 ) -> list[str]:
     if not memories:
         return []
+
+    personality_hint = ""
+    if character:
+        profile = character.get("character_profile", {}) or {}
+        personality = profile.get("personality", {}) or {}
+        style = personality.get("speaking_style", "")
+        shadow = personality.get("shadow_pattern", "")
+        job = character.get("job_profile", {}).get("role_name", "")
+        personality_hint = (
+            f"你是{job}，说话风格：{style}，"
+            f"内心阴影：{shadow}。\n"
+        )
 
     memory_text = "\n".join(
         f"- {memory.clock} [{memory.kind}] {memory.text}"
@@ -103,19 +128,18 @@ def _build_reflections(
         {
             "role": "system",
             "content": (
-                "你是职场模拟中的角色记忆反思模块。"
-                "请根据角色最近的记忆，提炼这个角色形成的稳定判断。"
+                f"你是职场模拟中的{display_name}。{personality_hint}"
+                "请根据最近的记忆，用你自己的语气提炼你形成的稳定判断。"
                 "只输出 JSON，不要 Markdown，不要解释。"
-                '格式：{"reflections":["反思1","反思2","反思3"]}'
+                '{"reflections":["反思1","反思2","反思3"]}'
             ),
         },
         {
             "role": "user",
             "content": (
-                f"角色：{display_name}\n"
                 f"最近记忆：\n{memory_text}\n\n"
                 "请生成 2 到 3 条短反思。"
-                "反思要像角色自己的内心判断，不要像正式工作总结。"
+                "反思要像你自己的内心独白，不要像工作总结。"
                 "优先关注：用户说的话、突发事件、同事态度、公司风险、自己的压力。"
             ),
         },

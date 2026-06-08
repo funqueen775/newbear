@@ -55,7 +55,7 @@ def build_actor_reaction_messages(
     memories: list[str] | None = None,
     incident: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    memory_text = "\n".join(f"- {item}" for item in (memories or [])[-5:])
+    memory_text = "\n".join(f"- {item}" for item in (memories or [])[-8:])
     if not memory_text:
         memory_text = "暂无"
 

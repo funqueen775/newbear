@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.core.world.runtime_state import EncounterRecord, MemoryRecord, WorldRuntimeState
+from src.core.world.runtime_state import EncounterRecord, MemoryRecord, RelationshipRecord, WorldRuntimeState
 
 
 
@@ -82,6 +82,10 @@ def write_step_memories(
                 memory_lines.append(
                     f"{clock} 我在{actor.location}听见{other_name}说：{other_speech}"
                 )
+                _update_relationship(
+                    actor, other_actor_id, other_speech,
+                    world.company.step, clock,
+                )
             elif other_task:
                 memory_lines.append(
                     f"{clock} 我在{actor.location}看到{other_name}在处理：{other_task}"
@@ -107,6 +111,10 @@ def write_step_memories(
                     memory_lines.append(f"{clock} 我在相遇对话中说：{speech}")
                 else:
                     memory_lines.append(f"{clock} 我在{actor.location}听见{speaker_name}说：{speech}")
+                    _update_relationship(
+                        actor, speaker_id, speech,
+                        world.company.step, clock,
+                    )
 
         if not memory_lines:
             continue
@@ -135,6 +143,34 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
         result.append(normalized)
 
     return result
+
+
+def _update_relationship(
+    observer: Any,
+    target_actor_id: str,
+    speech: str,
+    step: int,
+    clock: str,
+    is_positive: bool = True,
+) -> None:
+    if target_actor_id not in observer.relationships:
+        observer.relationships[target_actor_id] = RelationshipRecord(
+            target_actor_id=target_actor_id
+        )
+    rel = observer.relationships[target_actor_id]
+    rel.interaction_count += 1
+    rel.last_interaction_step = step
+    rel.last_interaction_clock = clock
+
+    if is_positive:
+        rel.trust = min(100, rel.trust + 3)
+    else:
+        rel.trust = max(0, rel.trust - 5)
+
+    if speech:
+        rel.impression = speech[:30]
+
+
 def estimate_importance(text: str, kind: str = "observation") -> int:
     score = 1
 
@@ -150,6 +186,8 @@ def estimate_importance(text: str, kind: str = "observation") -> int:
         score += 4
     elif kind == "incident":
         score += 6
+    elif kind == "pantry":
+        score += 3
 
 
     high_impact_words = [
@@ -172,6 +210,37 @@ def estimate_importance(text: str, kind: str = "observation") -> int:
             score += 2
 
     return min(10, max(1, score))
+
+
+MAX_MEMORY_STREAM = 120
+PROTECTED_RECENT = 10
+
+
+def _evict_lowest_importance(memory_stream: list[MemoryRecord]) -> list[MemoryRecord]:
+    if len(memory_stream) <= MAX_MEMORY_STREAM:
+        return memory_stream
+    protected = memory_stream[-PROTECTED_RECENT:]
+    candidates = memory_stream[:-PROTECTED_RECENT]
+    to_remove = len(memory_stream) - MAX_MEMORY_STREAM
+    candidates.sort(key=lambda m: m.importance)
+    survivors = candidates[to_remove:]
+    return sorted(protected + survivors, key=lambda m: m.memory_id)
+
+
+DEDUP_WINDOW = 20
+DEDUP_THRESHOLD = 0.65
+
+
+def _is_duplicate(new_text: str, existing: list[MemoryRecord]) -> bool:
+    new_chars = set(new_text)
+    for old in existing[-DEDUP_WINDOW:]:
+        old_chars = set(old.text)
+        overlap = len(new_chars & old_chars) / max(len(new_chars | old_chars), 1)
+        if overlap > DEDUP_THRESHOLD:
+            return True
+    return False
+
+
 def append_actor_memory(
     world: WorldRuntimeState,
     *,
@@ -190,6 +259,9 @@ def append_actor_memory(
     if not clean_text:
         return
 
+    if kind not in ("reflection", "meeting") and _is_duplicate(clean_text, actor.memory_stream):
+        return
+
     importance = estimate_importance(clean_text, kind)
 
     record = MemoryRecord(
@@ -206,9 +278,6 @@ def append_actor_memory(
 
     actor.memory_next_id += 1
     actor.memory_stream.append(record)
-    actor.memory_stream = actor.memory_stream[-80:]
-
-    actor.memory.append(clean_text)
-    actor.memory = actor.memory[-40:]
+    actor.memory_stream = _evict_lowest_importance(actor.memory_stream)
 
     actor.reflection_importance_buffer += importance

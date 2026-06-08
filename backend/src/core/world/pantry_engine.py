@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.core.world.day_schedule import PANTRY_SLOTS, scheduled_item, slot_index
+from src.core.config.pantry_events import SCRIPTED_PANTRY_EVENTS
 from src.core.world.memory_engine import append_actor_memory
 from src.core.world.runtime_state import ActivePantryState, WorldRuntimeState
 
@@ -11,60 +11,53 @@ def trigger_pantry_for_clock(world: WorldRuntimeState, clock: str) -> ActivePant
     if world.active_pantry is not None:
         return world.active_pantry
 
-    index = slot_index(normalized_clock, PANTRY_SLOTS)
-    if index is None:
-        return None
+    for index, item in enumerate(SCRIPTED_PANTRY_EVENTS, start=1):
+        pantry_id = f"pantry-{index}"
+        pantry_time = str(item.get("time", "")).strip()
 
-    item = scheduled_item(
-        "pantry",
-        world.pantry_topic_ids,
-        world.seed_id,
-        PANTRY_SLOTS,
-        index,
-    )
-    if item is None:
-        return None
+        if pantry_id in world.triggered_pantry_ids:
+            continue
 
-    pantry_id = str(item.get("id") or f"pantry-slot-{index + 1}")
+        if pantry_time != normalized_clock:
+            continue
 
-    if pantry_id in world.triggered_pantry_ids:
-        return None
+        participants = list(world.actors.keys())
 
-    participants = list(world.actors.keys())
+        pantry = ActivePantryState(
+            pantry_id=pantry_id,
+            time=pantry_time,
+            title=str(item.get("title", "")),
+            content=str(item.get("content", "")),
+            participants=participants,
+            day=world.company.day,
+            step=world.company.step,
+            clock=world.company.clock,
+        )
 
-    pantry = ActivePantryState(
-        pantry_id=pantry_id,
-        time=normalized_clock,
-        title=str(item.get("title", "")),
-        content=str(item.get("content", "")),
-        participants=participants,
-        day=world.company.day,
-        step=world.company.step,
-        clock=world.company.clock,
-    )
+        world.active_pantry = pantry
+        world.triggered_pantry_ids.add(pantry_id)
 
-    world.active_pantry = pantry
-    world.triggered_pantry_ids.add(pantry_id)
+        for actor_id in participants:
+            actor = world.actors.get(actor_id)
+            if actor:
+                actor.location = "休闲区"
+                actor.current_task = f"茶水间闲谈：{pantry.title}"
+                actor.intent = "communicate"
+                actor.move_to = "休闲区"
 
-    for actor_id in participants:
-        actor = world.actors.get(actor_id)
-        if actor:
-            actor.location = "休闲区"
-            actor.current_task = f"茶水间闲谈：{pantry.title}"
-            actor.intent = "communicate"
-            actor.move_to = "休闲区"
+        world.company.logs.append(
+            {
+                "type": "pantry_triggered",
+                "clock": normalized_clock,
+                "pantry_id": pantry_id,
+                "title": pantry.title,
+                "participants": participants,
+            }
+        )
 
-    world.company.logs.append(
-        {
-            "type": "pantry_triggered",
-            "clock": normalized_clock,
-            "pantry_id": pantry_id,
-            "title": pantry.title,
-            "participants": participants,
-        }
-    )
+        return pantry
 
-    return pantry
+    return None
 
 
 def add_user_pantry_message(world: WorldRuntimeState, message: str) -> ActivePantryState | None:
@@ -102,7 +95,7 @@ def close_active_pantry(world: WorldRuntimeState) -> None:
         append_actor_memory(
             world,
             actor_id=actor_id,
-            kind="meeting",
+            kind="pantry",
             text=memory_text,
             clock=world.company.clock,
             related_actor_ids=[item for item in pantry.participants if item != actor_id],
