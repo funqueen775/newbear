@@ -1,10 +1,10 @@
-# BE-007 personality_model v0.3 人格评分模块 — 规划文档
+# BE-007 personality_model v0.4 人格评分模块 — 规划文档
 
 ## 模块概述
 
-接入陈鸿淼的 `personality-model v0.3`，把玩家在一轮游戏中的回应和当前事件上下文转成结构化人格评分结果。模块先作为后端内部评分引擎落地，不直接改现有前端流程，也不直接替换 `report_engine`。
+接入陈鸿淼的 `personality-model v0.4`，把玩家在一轮游戏中的回应和当前事件上下文转成结构化人格评分结果。当前已完成后端内部评分引擎迁移、newbear adapter、scene/session 聚合、profile smoothing 和测试；还没有把 HTTP 路由与现有游戏流程自动触发接到 `server.py`。
 
-本阶段目标是完成可复用的后端评分模块，为后续 BE-008 profile/trend API 和报告页增强提供稳定输入。
+本阶段目标是完成可复用的后端评分模块，为后续 BE-008 profile/trend API、日终汇总、老板信和人格报告页增强提供稳定输入。
 
 ## 文件清单
 
@@ -18,8 +18,15 @@
 | `backend/src/core/world/personality_model/llm_scorer.py` | 新增 | DeepSeek/OpenAI-compatible LLM 调用与 JSON 归一化 |
 | `backend/src/core/world/personality_model/hybrid_scorer.py` | 新增 | rule / LLM / hybrid 融合逻辑和 `final_result` 输出 |
 | `backend/src/core/world/personality_model/report_builder.py` | 新增 | 多事件 session 汇总 |
+| `backend/src/core/world/personality_model/adapters/` | 新增 | v0.4 payload / newbear runtime / v04 event adapters |
+| `backend/src/core/world/personality_model/aggregation.py` | 新增 | scene/session 聚合 |
+| `backend/src/core/world/personality_model/profile_updater.py` | 新增 | 长期画像 smoothing |
+| `backend/src/core/world/personality_model/service.py` | 新增 | newbear 后端可直接调用的 v0.4 service facade |
+| `backend/src/core/world/personality_analyzer.py` | 新增 | 兼容旧文档入口名的薄封装 |
+| `backend/test_personality_model_v04.py` | 新增 | v0.4 import / adapter / scoring / aggregation / profile 测试 |
 | `docs/plan-be-007-personality-model-v03.md` | 新增 | 本规划文档 |
 | `docs/log-be-007-personality-model-v03.md` | 新增 | 开发日志 |
+| `docs/log-be-007-personality-model-v04.md` | 新增 | v0.4 迁移日志 |
 
 ## 数据流
 
@@ -50,12 +57,14 @@ final_result
 本阶段不新增 HTTP 路由，先提供后端内部 Python 接口：
 
 ```python
-from src.core.world.personality_model.hybrid_scorer import score
-from src.core.world.personality_model.schemas import ScoreInput
+from src.core.world.personality_model.service import (
+    analyze_personality_session,
+    score_personality_events,
+    update_personality_profile,
+    get_personality_profile_response,
+)
 
-score_input = ScoreInput.from_dict(payload)
-result = score(score_input, method="hybrid", use_llm=False)
-data = result.to_dict()
+result = analyze_personality_session({"events": [event_payload]})
 ```
 
 后续后端可在 `server.py` 中封装：
@@ -64,6 +73,8 @@ data = result.to_dict()
 |------|------|
 | `POST /score/event` | 单事件评分，返回 `final_result` |
 | `POST /score/session` | 多事件评分，返回 events + session_report |
+
+当前状态：以上 HTTP 路由还没有接进 `server.py`。后端同学如果需要调试型 HTTP API，可以用 `service.py` 的四个函数直接封装。
 
 ## 输入契约
 
@@ -133,17 +144,7 @@ final_result.feedback
 
 默认不依赖外部 LLM，`LLM_ENABLED=false` 或缺少 API key 时自动 fallback 到 `rule_baseline`。
 
-可选环境变量：
-
-```bash
-DEEPSEEK_API_KEY=your_key_here
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
-LLM_ENABLED=true
-LLM_TIMEOUT_SECONDS=30
-```
-
-`.env`、真实 API key、运行输出不得提交仓库。
+后续如需启用真实 LLM，应由后端同学在部署环境中显式配置 DeepSeek-compatible 变量并传入 `use_llm=True`。`.env`、真实 API key、运行输出不得提交仓库，也不要在文档中写出 key 示例值。
 
 ## 与现有 newbear 的接入点
 
@@ -155,10 +156,11 @@ LLM_TIMEOUT_SECONDS=30
 | `/api/meeting/say` | `response_meta.user_free_text_input = message`，`scene_name = meeting` |
 | `/api/pantry/say` | `response_meta.user_free_text_input = message`，`scene_name = pantry` |
 
-已新增 adapter：
+已新增 v0.4 service 和 adapter：
 
 ```text
-backend/src/core/world/personality_model/adapter.py
+backend/src/core/world/personality_model/service.py
+backend/src/core/world/personality_model/adapters/newbear_adapter.py
 ```
 
 adapter 负责把主项目里的 `user + world + scene + 玩家输入` 转换成 personality-model 需要的 `ScoreInput`。当前还没有改 `server.py`，不会影响现有接口运行；下一步是在后端输入入口接入调用。
@@ -167,35 +169,49 @@ adapter 负责把主项目里的 `user + world + scene + 玩家输入` 转换成
 
 ```text
 server.py / world flow
-  -> build_score_input_from_world(...)
-  -> personality_model.score(...)
-  -> persist final_result.feedback / evidence
+  -> analyze_personality_session(...) 或 score_personality_events(...)
+  -> persist events / session_score / profile_update
+  -> expose sanitized session_report to report pages
 ```
 
 调用示例：
 
 ```python
-from src.core.world.personality_model.adapter import build_score_input_from_world
-from src.core.world.personality_model.hybrid_scorer import score
+from src.core.world.personality_model.service import analyze_personality_session
 
-score_input = build_score_input_from_world(
-    user=user,
-    world=world,
-    scene="world",  # 或 "meeting" / "pantry"
-    user_text=affair,  # meeting / pantry 场景传 message
+result = analyze_personality_session(
+    {
+        "user": user,
+        "world": world,
+        "scene": "world",  # 或 "meeting" / "pantry"
+        "user_text": affair,  # meeting / pantry 场景传 message
+        "old_profile": existing_profile,
+    }
 )
-
-result = score(score_input, method="hybrid", use_llm=False)
-final_result = result.final_result
 ```
 
 接入注意事项：
 
 - `/api/step` 建议在 `run_one_step(world, affair=affair)` 之前生成 `score_input`，这样 adapter 能拿到当前 `pending_incident`。
 - `/api/meeting/say` 和 `/api/pantry/say` 可以在 `add_user_meeting_message` / `add_user_pantry_message` 附近接。
-- 第一版建议 `use_llm=False`，只跑规则 fallback。
+- 第一版默认 `use_llm=False`，只跑规则 fallback；真实 DeepSeek / LLM 后续单独接。
 - 评分失败时建议只记录日志，不要阻断主流程。
 - 后端还需要决定 `final_result.feedback` 写回哪里，以及 `final_result.evidence` / `decision_style` 是否存给报告页。
+
+## 还需要后端同学完成的主流程集成
+
+当前 BE-007 v0.4 引擎已完成，但还没有自动接入游戏流程。后端同学需要确认当前是否仍在使用旧人格/报告逻辑，并完成以下集成：
+
+| 位置 | 要做的事 |
+|------|------|
+| `/api/step` | 玩家主界面输入时调用 `analyze_personality_session` 或 `score_personality_events` |
+| `/api/meeting/say` | 会议室自由输入后生成评分事件 |
+| `/api/pantry/say` | 茶水间自由输入后生成评分事件 |
+| `/score/event` | 如需要 HTTP 调试接口，封装单事件评分 |
+| `/score/session` | 如需要 HTTP 调试接口，封装 session 聚合 |
+| 持久化 | 保存 scored events，供日终/session 汇总读取 |
+| M9/profile | 将 `profile_update` 或 `final_result.feedback` 写入合适位置 |
+| 第 11-14 页 | 将 `session_score` / evidence / decision_style 接到日终、老板信和人格报告页 |
 
 ## 假设
 
